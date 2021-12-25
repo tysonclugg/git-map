@@ -1,0 +1,290 @@
+#!/bin/sh
+#
+# git-map.sh:
+set -ef
+
+dashless=$(basename -- "$0" | sed -e 's/-/ /')
+
+quote () {
+	printf %s "$1" \
+	| sed "s/'/'\\\\''/g;1s/^/'/;\$s/\$/'/" \
+	| sed "s|^'\([-_,./a-zA-Z0-9]\+\)'$|\1|"
+}
+
+quote_all () {
+	( for arg in "$@"; do quote "$arg" && printf ' '; done ) \
+	| sed -e "s/ $//"
+}
+
+ORIGINAL_COMMAND="$dashless $(quote_all "$@")"
+
+tmpdir=
+mktmpdir() {
+	if test -z "$tmpdir"
+	then
+		tmpdir="$(mktemp -d ${TMPDIR:-/tmp}/git-map.$$.XXXXXXXXXX)" || die "can't create temp directory"
+		trap 'rm -rf "${tmpdir}"' EXIT HUP INT TERM
+	fi
+}
+
+if test -z "${GIT_MAP_COMMAND_TRAILER}"
+then
+	GIT_MAP_COMMAND_TRAILER="$(git config --default Map-Command --get map.command-trailer)"
+fi
+
+GLOBAL_OPTIONS_SPEC="\
+ Global options
+h,help      show help
+q,quiet     only print error messages
+"
+
+APPLY_USAGE="\
+$dashless apply [--ignore-revs-file <file>] [--] <command> <pathspec>..."
+
+APPLY_OPTIONS_SPEC="\
+$APPLY_USAGE
+
+Apply map <command> to all files matching <pathspec>, optionally adding revision to ignore file.
+--
+$GLOBAL_OPTIONS_SPEC
+ $dashless apply options
+n,max-args=max-args     use at most max-args arguments per command line
+1                       use at most 1 argument per command line
+i,ignore                ignore changes made by '$dashless apply' in 'git blame' output
+mergetool*				mergetool mode (requires env: BASE LOCAL REMOTE MERGED)
+"
+
+apply_subcommand() {
+	OPTIONS_SPEC="$APPLY_OPTIONS_SPEC"
+	OPTIONS_STUCKLONG=1
+	. "$(git --exec-path)/git-sh-setup"
+	unset command pathspec ignore_revs_file max_args mergetool
+	require_work_tree
+	mktmpdir
+	while test $# -gt 0
+	do
+		opt="$1"; shift
+		case "$opt" in
+		-q|--quiet)
+			export GIT_QUIET=1 ;;
+		-1)
+			max_args=1
+			;;
+		--max-args)
+			max_args=$1; shift
+			;;
+		--ignore)
+			ignore_revs_file="$(git config --get blame.ignoreRevsFile)" ||
+			die "No git config for 'blame.ignoreRevsFile'"
+			;;
+		--mergetool)
+			mergetool=1
+			: ${BASE:?} ${LOCAL:?} ${REMOTE:?} ${MERGED:?}
+			;;
+		--)
+			test -z "$mergetool" && require_clean_work_tree
+			command="$1"; test $# -gt 0 && shift || die "Missing command"
+			test $# -gt 0 || die "Missing pathspec"
+			pathspec="$@"
+			# dump matching paths into file list
+			git ls-files -z -- "$@" >> "${tmpdir}/files"
+			break
+			;;
+		*)
+			die "Unknown option: $opt"
+			;;
+		esac
+	done
+	if test -n "$mergetool"
+	then
+		sane_grep -q --null -E "(\x0|^)${MERGED}(\x0|$)" "$tmpdir/files" || { sleep 600; die "${MERGED} doesn't match $*" command; }
+		#cp ${REMOTE} ${MERGED}
+		#printf %s "${MERGED}" | xargs -0to $command || exit $?
+		#git diff "${MERGED}" || exit $?
+		#exit 0
+		# common ancestor may not exist
+		# apply $command to common ancestor
+		if test -w "${BASE}"
+		then
+			printf %s "${BASE}" | xargs -0ton1 $command || exit $?
+		fi
+		# apply $command to local target file
+		printf %s "${LOCAL}" | xargs -0ton1 $command || exit $?
+		# apply $command to remote (merged/rebased) file
+		printf %s "${REMOTE}" | xargs -0ton1 $command || exit $?
+		exit 0
+	fi
+	sort -zu "${tmpdir}/files" | xargs -0 ${max_args:+-n ${max_args}} $command
+	git add --pathspec-file-nul --pathspec-from-file="${tmpdir}/files"
+	cat >"${tmpdir}/commit.pre" <<-EOF
+	$ORIGINAL_COMMAND
+
+	This commit is expected to result in merge conflicts due to the nature of
+	changes made by running the referenced map command.
+
+	Visit https://github.com/tysonclugg/git-map for further details.
+
+	${GIT_MAP_COMMAND_TRAILER}: $(quote "${command}") $(quote_all "$@")
+	EOF
+	# strip trailing newline
+	printf %s "$(cat "${tmpdir}/commit.pre")" > "${tmpdir}/commit.msg"
+
+	# write commit or abort
+	git commit --file="${tmpdir}/commit.msg" --edit || exit $?
+
+	# write ignore-revs-file (if required)
+	test -n "${ignore_revs_file}" || exit 0
+	cat >> "${ignore_revs_file}" <<-EOF
+	# ${ORIGINAL_COMMAND}
+	$(git rev-parse --verify HEAD)
+	EOF
+	git add "${ignore_revs_file}"
+	git commit -m"Ignore changes from $(git rev-parse --verify HEAD)
+	${ORIGINAL_COMMAND}" --edit
+}
+
+MERGETOOL_USAGE="\
+$dashless mergetool [--] <path>...
+$dashless mergetool --init [--global|--system|--local|--worktree|--file <file>]"
+MERGETOOL_OPTIONS_SPEC="\
+$MERGETOOL_USAGE
+
+Autofix merge/rebase conflicts resulting from '$dashless apply'.
+--
+$GLOBAL_OPTIONS_SPEC
+ $dashless mergetool options
+init            apply default options to config file
+b*=BASE		    common base file for merge
+l*=LOCAL	    file on the current branch
+r*=REMOTE	    file to be merged
+m*=MERGED	    file to write the result of the merge
+ Config file location (only used with --init)
+global          use global config file
+system          use system config file
+local           use repository config file
+worktree        use per-worktree config file
+f,file=file     use given config file
+"
+
+mergetool_subcommand() {
+	OPTIONS_SPEC="$MERGETOOL_OPTIONS_SPEC"
+	. "$(git --exec-path)/git-sh-setup"
+	unset init git_config_opts BASE LOCAL REMOTE MERGED COMMON_BASE
+	while test $# -gt 0
+	do
+		opt="$1"; shift
+		case "$opt" in
+		-q|--quiet)
+			export GIT_QUIET=1 ;;
+		--init)
+			init=1 ;;
+		--global|--system|--local|worktree)
+			git_config_opts="$git_config_opts $opt" ;;
+		-f|--file)
+			git_config_opts="$git_config_opts $opt $1"; shift ;;
+		-b)
+			export BASE="$1"; shift ;;
+		-l)
+			export LOCAL="$1"; shift ;;
+		-r)
+			export REMOTE="$1"; shift ;;
+		-m)
+			export MERGED="$1"; shift ;;
+		--)
+			;;
+		*)
+			die "Unkown option: $opt" ;;
+		esac
+	done
+	require_work_tree
+	if test -n "$init"
+	then
+		git config --replace-all $git_config_opts mergetool.map.cmd \
+			"$dashless mergetool -b \"\$BASE\" -l \"\$LOCAL\" -r \"\$REMOTE\" -m \"\$MERGED\"" \
+			|| exit $?
+		git config --replace-all $git_config_opts --bool mergetool.map.trustExitCode false \
+			|| exit $?
+		exit 0
+	fi
+	if test -z "${BASE}${LOCAL}${REMOTE}${MERGED}"
+	then
+		git mergetool --tool=map "$@"
+		exit $?
+	fi
+	: ${LOCAL:?} ${REMOTE:?} ${MERGED:?}
+	mktmpdir
+	if MERGE_HEAD=$(git rev-parse --verify MERGE_HEAD 2>/dev/null)
+	then
+		COMMON_BASE=$MERGE_HEAD
+	else
+		if REBASE_HEAD=$(git rev-parse --verify REBASE_HEAD 2>/dev/null)
+		then
+			COMMON_BASE=$REBASE_HEAD
+		else
+			die "Can't find common base from MERGE_HEAD or REBASE_HEAD"
+		fi
+	fi
+	# find all map commands between both branches, apply in topological order
+	git log \
+		--pretty="%(trailers:key=${GIT_MAP_COMMAND_TRAILER},valueonly)" \
+		--topo-order --reverse \
+		${COMMON_BASE}...HEAD HEAD...${COMMON_BASE} \
+		| sane_grep . > "$tmpdir/map.list"
+	while IFS='\n' read -r line
+	do
+		say "${GIT_MAP_COMMAND_TRAILER}: ${line}"
+		eval "$(echo $dashless apply --mergetool -- ${line}) || exit \$?"
+	done <"$tmpdir/map.list"
+	if test -z "${BASE}"
+	then
+		cp -v "${LOCAL}" "${MERGED}"
+	else
+		# map commands have been applied to conflicted files, derive and apply a patch
+		diff -U3 --label "a/${MERGED}" --label "b/${MERGED}" "${BASE}" "${LOCAL}" | tee "$tmpdir/mergetool.patch"
+		cp -v "${BASE}" "${MERGED}"
+		git apply --stat --apply "$tmpdir/mergetool.patch"
+	fi
+	exit 1
+}
+
+OPTIONS_SPEC_BASE="\
+$APPLY_USAGE
+$MERGETOOL_USAGE
+--
+$GLOBAL_OPTIONS_SPEC
+"
+
+show_usage() {
+	err=${1}
+	eval "$(
+		echo "$OPTIONS_SPEC_BASE" | git rev-parse --parseopt --stop-at-non-option -- -h ||
+		echo true
+	)"
+	exit $err
+}
+
+# main entry point
+while test $# -gt 0
+do
+	cmd="$1"; shift
+	case "$cmd" in
+	apply)
+		apply_subcommand "$@"
+		exit $? ;;
+	init)
+		init_subcommand "$@"
+		exit $? ;;
+	mergetool)
+		mergetool_subcommand "$@"
+		exit $? ;;
+	-q|--quiet)
+		export GIT_QUIET=1 ;;
+	-h|--help)
+		show_usage 0 ;;
+	*)
+		echo "Unknown command: $cmd"
+		show_usage 129 ;;
+	esac
+done
+# fallback if no options supplied above
+show_usage 0
